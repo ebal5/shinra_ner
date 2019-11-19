@@ -1,47 +1,56 @@
 import argparse
-import glob
+import copy
+import io
+import json
 import logging
 import os
-import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from enum import Flag, auto
-import shutil
-from itertools import groupby
+from functools import reduce
+from itertools import groupby, product
 from logging.handlers import TimedRotatingFileHandler
 from operator import itemgetter
+from pathlib import Path
 from typing import List, Tuple
-from functools import reduce
-import tempfile
 
 import mojimoji
 from joblib import Parallel, delayed
 
-from shinra_ner.shinra_error import ShinraError
-
+from shinra_error import ShinraError
+from tools import html as htmltools
 
 pairs = {'1_1': {'ARTIFACT': ['作品', '受賞歴', '参加イベント'],
-         'DATE': ['生年月日', '没年月日'],
-         'LOCATION': ['生誕地', '居住地', '没地'],
-         'ORGANIZATION': ['所属組織'],
-         'PERSON': ['師匠', '両親', '家族']},
- '1_10_2': {},
- '1_4_6_2': {'ARTIFACT': ['取扱商品', '商品名'],
-             'DATE': ['従業員数（単体）データの年'],
-             'LOCATION': ['創業国', '創業地', '本拠地国', '本拠地'],
-             'MONEY': ['売上高（単体）'],
-             'ORGANIZATION': ['子会社・合弁会社', '買収・合併した会社', '主要株主'],
-             'PERSON': ['代表者']},
- '1_5_1_1': {'ARTIFACT': ['観光地', '恒例行事', '特産品'],
-             'DATE': ['人口データの年'],
-             'LOCATION': ['友好市区町村'],
-             'ORGANIZATION': ['鉄道会社'],
-             'PERSON': ['首長']},
- '1_6_5_3': {'ARTIFACT': ['名称由来人物の地位職業名'],
-             'DATE': ['年間利用者数データの年'],
-             'LOCATION': ['国', '所在地', '母都市'],
-             'ORGANIZATION': ['運営者'],
-             'TIME': ['運用時間']}}
+                 'DATE': ['生年月日', '没年月日'],
+                 'LOCATION': ['生誕地', '居住地', '没地'],
+                 'ORGANIZATION': ['所属組織'],
+                 'PERSON': ['師匠', '両親', '家族']},
+         '1_10_2': {},
+         '1_4_6_2': {'ARTIFACT': ['取扱商品', '商品名'],
+                     'DATE': ['従業員数（単体）データの年'],
+                     'LOCATION': ['創業国', '創業地', '本拠地国', '本拠地'],
+                     'MONEY': ['売上高（単体）'],
+                     'ORGANIZATION': ['子会社・合弁会社', '買収・合併した会社', '主要株主'],
+                     'PERSON': ['代表者']},
+         '1_5_1_1': {'ARTIFACT': ['観光地', '恒例行事', '特産品'],
+                     'DATE': ['人口データの年'],
+                     'LOCATION': ['友好市区町村'],
+                     'ORGANIZATION': ['鉄道会社'],
+                     'PERSON': ['首長']},
+         '1_6_5_3': {'ARTIFACT': ['名称由来人物の地位職業名'],
+                     'DATE': ['年間利用者数データの年'],
+                     'LOCATION': ['国', '所在地', '母都市'],
+                     'ORGANIZATION': ['運営者'],
+                     'TIME': ['運用時間']}}
+cat2ene = {
+    "airport": "1.6.5.3",
+    "city": "1.5.1.1",
+    "company": "1.4.6.2",
+    "compound": "1.10.2",
+    "person": "1.1"
+}
 
 
 class ConfigurationError(ShinraError):
@@ -51,47 +60,55 @@ class ConfigurationError(ShinraError):
 def main():
     parser = _mk_argparser()
     args = parser.parse_args()
-    logger = _mk_logger(args.debug_mode)
+    logger = _mk_logger(args.debug, args.log_file)
     dirs = [args.html_dir, args.plain_dir]
     files = [args.id_list]
-    if _check_environ(files, dirs, logger=logger):
+    if not _check_environ(files, dirs, logger=logger):
         exit(1)
-        pass
+    logger.info("environ check cleared")
     with open(args.id_list) as f:
         id_list = f.read().split("\n")
+    if id_list[-1] == "":
+        id_list = id_list[:-1]
+    logger.info("I've got id list.")
+    ene = cat2ene.get(args.category.lower(), None)
+    if ene is None:
+        print(f"Invalid category name: {args.category}", file=sys.stderr)
+        exit(1)
     knp_extract_files(args.html_dir, args.plain_dir,
-                      id_list, args.output, logger=logger)
+                      id_list, args.output, ene,
+                      logger=logger, multi=args.multi)
 
 
 def _check_environ(files, dirs, *, logger=None):
     logger = logger or logging.getLogger(__name__)
     logger.info("check if some executables exists")
-    result = []
+    results = []
     reqs = {"knp", "juman", "jumanpp"}
     exists = [bool(shutil.which(exe)) for exe in reqs]
     if not reduce(lambda x, acc: x & acc, exists):
         misses = [cmd for cmd, ex in zip(reqs, exists) if not ex]
-        results.append(f"missing commands: {*misses}")
+        results.append(f"missing commands: {misses}")
     logger.info("check if dirs are exist")
     exists = [path for path in dirs if not os.path.exists(path)]
     if exists != []:
-        results.append(f"not exists: {*exists}")
+        results.append(f"not exists: {exists}")
     logger.info("check if files are exist")
     exists = [path for path in files if not os.path.isfile(path)]
     if exists != []:
-        results.append(f"not file: {*exists}")
+        results.append(f"not file: {exists}")
     if results != []:
-        print("\n".join(results))
+        print("\n".join(results), file=sys.stderr)
         return False
     return True
 
 
-def _mk_logger(debug_mode):
+def _mk_logger(debug_mode, log_file="irex_ner.log"):
     level = logging.WARNING if not debug_mode else logging.DEBUG
     logging.basicConfig(level=level)
     root_logger = logging.getLogger(__name__)
     handler = TimedRotatingFileHandler(
-        filename=args.log_file,
+        filename=log_file,
         when="D",
         interval=1,
         backupCount=31,
@@ -199,10 +216,12 @@ def knp_irex(line, *, logger=None, config=None):
     text = text.replace(u'\xa0', '　')
     diff = [i for i, b, a in zip(range(len(text)), line, text) if b != a]
     try:
-        jprs = subprocess.run(config.juman, input=text, text=True,
+        jprs = subprocess.run(config.juman,
+                              input=text, text=True, encoding='utf-8',
                               stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE)
-        kprs = subprocess.run(config.knp, input=jprs.stdout, text=True,
+        kprs = subprocess.run(config.knp,
+                              input=jprs.stdout, text=True, encoding='utf-8',
                               stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE)
     except UnicodeDecodeError as e:
@@ -230,7 +249,7 @@ def knp_irex(line, *, logger=None, config=None):
     return nel
 
 
-def net_merge(nel):
+def net_merge(nel: List[Tuple[str, str, str]]):
     """
     解析結果からIREX NEを作成する．
 
@@ -257,11 +276,12 @@ def net_merge(nel):
     return nes
 
 
-def knp_analysis_file(stream, *, logger=None, config=None):
+def knp_analysis_file(target, *, logger=None, config=None):
     logger = logger or logging.getLogger(__name__)
     config = config or Config(logger=logger)
     idx = -1
     nes = []
+    stream = io.StringIO(target) if type(target) == str else target
     for line in stream.readlines():
         idx += 1
         if line.isascii():
@@ -270,6 +290,7 @@ def knp_analysis_file(stream, *, logger=None, config=None):
             nel = knp_irex(line, logger=logger, config=config)
         except ShinraError as e:
             logger.error(f"UnicodeDecodeError on '{line.encode()}'")
+            logger.error(f"Error message: {str(e)}")
             continue
         nes.extend([(*entry, idx) for entry in net_merge(nel)])
     s_nes = sorted(nes, key=itemgetter(0))
@@ -284,23 +305,64 @@ def knp_analysis_file(stream, *, logger=None, config=None):
 
 
 def knp_extract_files(html_dir, plain_dir, id_list, output, ene,
-                      *, logger=None):
+                      *, multi=1, logger=None, config=None):
+    logger = logger or logging.getLogger(__name__)
+    logger.info("will extract files")
+    config = config or Config(logger=logger)
+    hdir = Path(html_dir)
+    pdir = Path(plain_dir)
+    tdir = Path(tempfile.mkdtemp())
+    logger.info(f"opened {str(tdir)} as tmpdir")
+    Parallel(n_jobs=multi)([
+        delayed(knp_extract_file)(hdir.joinpath(pid+".html"),
+                                  pdir.joinpath(pid+".txt"),
+                                  ene, pid, tdir,
+                                  config=config)
+        for pid in id_list
+    ])
+    logger.info("all files are extracted")
+    try:
+        with open(Path(output), "w") as outf:
+            for resf in tdir.glob("*.json"):
+                with open(resf) as _rf:
+                    outf.write(_rf.read())
+        shutil.rmtree(tdir)
+    except Exception as e:
+        logger.error(f"some error: {str(e)}")
+
+
+def knp_extract_file(hpath: Path, ppath: Path, ene, pid, odir: Path,
+                     *, logger=None, config=None):
+    logger = logger or logging.getLogger(__name__)
+    config = config or Config(logger=logger)
+    with open(hpath) as _hf:
+        html = _hf.read()
+    with open(ppath) as _pf:
+        plain = _pf.read()
+    try:
+        analyzed = knp_analysis_file(plain, logger=logger)
+        title = htmltools.get_title(html)
+    except ShinraError as e:
+        logger.error(f"PID: {pid} :: {str(e)}")
+        raise ShinraError(f"Error in PID: {pid}, msg: {str(e)}", e)
+    enekey = ene.replace(".", "_")
     base = {
+        "page_id": str(pid),
+        "title": title,
         "ENE": ene
     }
-    pass
-
-
-def knp_extract_file(config, *, logger=None):
-    logger = logger or logging.getLogger(__name__)
-    pass
+    with open(odir.joinpath(f"{pid}.json"), "w") as _of:
+        mypair = pairs[enekey]
+        for ne, attrs in mypair.items():
+            nel = analyzed.get(ne, None)
+            if not nel:
+                continue
+            for (attr, ne) in product(attrs, nel):
+                obj = copy.copy(base)
+                obj["text_offset"] = ne
+                obj["attribute"] = attr
+                print(json.dumps(obj), file=_of)
 
 
 if __name__ == "__main__":
     main()
-
-
-def test():
-    p = "/home/s173342/Data/Shinra/2019/plain/airport/31781.txt"
-    with open(p) as f:
-        return knp_analysis_file(f)
