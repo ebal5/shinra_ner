@@ -7,6 +7,47 @@ NER を利用した抽出器の作成（for Shinra2019 JP-5 and JP-30）
 よく考えたら Apache との互換性がないとかで死ぬのでは？
 まぁあまり気にするでもないか．
 
+データ形式
+---------
+
+提出形式
+^^^^^^^^^
+
+::
+   {
+   "page_id": ページ ID: str,
+   "title": ページタイトル: str,
+   "ENE": Extended Named Entity: str,
+   "attribute": 属性名: str,
+   "html_offset": {
+       "start": {
+           "line_id": 開始位置行番号: int,
+           "offset": 開始位置文字番号: int,
+       }
+       "end": {
+           "line_id": 終了位置行番号: int,
+           "offset": 終了位置文字番号: int,
+       }
+       "text": 内部に存在する文字列: str
+   },
+   "text_offset": {
+       "start": {
+           "line_id": 開始位置行番号: int,
+           "offset": 開始位置文字番号: int,
+       }
+       "end": {
+           "line_id": 終了位置行番号: int,
+           "offset": 終了位置文字番号: int,
+       }
+       "text": 内部に存在する文字列: str
+   }
+   }
+
+irex_ner
+---------
+
+IREX の定義に基づく NER プログラム．提出形式での結果を出力する
+
 tools
 ---------
 

@@ -11,6 +11,11 @@ autopep8 = "*"
 pyflakes = "*"
 pylint = "*"
 flake8 = "*"
+yapf = "*"
+python-language-server = "*"
+pyls-isort = "*"
+pyls-mypy = "*"
+isort = "*"
 
 [packages]
 joblib = "*"
