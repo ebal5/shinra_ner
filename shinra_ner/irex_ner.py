@@ -420,6 +420,25 @@ def knp_tab2iobtag(juman_lines, *, logger=None, config=None):
     return nel
 
 
+def collect_iobtag(iobtagl, *, logger=None):
+    logger = logger or logging.getLogger(__name__)
+    tagl = []
+    buf = ""
+    for _w, _t in iobtagl:
+        ne = _t[4:-3]
+        ptn = _t[-2]
+        if ptn in {"S", "E"}:
+            buf += _w
+            tagl.append((buf, ne))
+            buf = ""
+        elif ptn in {"B", "I"}:
+            buf += _w
+        else:
+            logger.error(f"invalid:: {_w, _t}")
+            raise ShinraError("Invalid IOBTAG")
+    return tagl
+
+
 def knp_string(string: str, *, logger=None, config=None):
     """
     現在はstring = 1行となっている？
