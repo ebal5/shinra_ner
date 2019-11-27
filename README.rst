@@ -17,7 +17,7 @@ NER を利用した抽出器の作成（for Shinra2019 JP-5 and JP-30）
    {
    "page_id": ページ ID: str,
    "title": ページタイトル: str,
-   "ENE": Extended Named Entity: str,
+   "ENE": Extended Named Entity dot separated: str,
    "attribute": 属性名: str,
    "html_offset": {
        "start": {
@@ -60,3 +60,5 @@ html タグの開始文字"<"は html offset ではそれ自身を示すが，
 
 - p2h は one-to-one
 - h2p は n-to-one
+
+オフセットが一意に定まらない問題，考えるまでもなく p2h のときは<でない位置にあわせるのが正解だなこれ．

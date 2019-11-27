@@ -214,33 +214,38 @@ def knp_irex(line, *, logger=None, config=None):
     config = config or Config(logger=logger)
     text = mojimoji.han_to_zen(line)
     text = text.replace(u'\xa0', '　')
-    diff = [i for i, b, a in zip(range(len(text)), line, text) if b != a]
+    # diff = [i for i, b, a in zip(range(len(text)), line, text) if b != a]
+    print(text)
     try:
         jprs = subprocess.run(config.juman,
                               input=text, text=True, encoding='utf-8',
+                              errors='replace',
                               stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE)
         kprs = subprocess.run(config.knp,
                               input=jprs.stdout, text=True, encoding='utf-8',
+                              errors='replace',
                               stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE)
     except UnicodeDecodeError as e:
         raise ShinraError(e)
     nel = []
     acc = 0
-    for line in kprs.stdout.split("\n"):
-        if len(line) and line[0] in {"+", "*", "#"}:
+    for _l in kprs.stdout.split("\n"):
+        if len(_l) and _l[0] in {"+", "*", "#"}:
             continue
-        lst = line.split(" ")
+        lst = _l.split(" ")
         _t = lst[-1]
-        _w = lst[0]
-        while diff and (acc + len(_w)) > diff[0]:
-            wp = diff[0] - acc
-            tmp = _w
-            _w = _w[:wp] + mojimoji.zen_to_han(_w[wp]) + _w[wp+1:]
-            if tmp == _w:
-                _w = _w[:wp] + '\xa0' + _w[wp+1:]
-            diff = diff[1:]
+        _w = line[acc:acc+len(lst[0])]
+        # while diff and (acc + len(_w)) > diff[0]:
+        #     wp = diff[0] - acc
+        #     tmp = _w
+        #     _w = _w[:wp] + mojimoji.zen_to_han(_w[wp]) + _w[wp+1:]
+        #     if tmp == _w:
+        #         _w = _w[:wp] + '\xa0' + _w[wp+1:]
+        #     diff = diff[1:]
+        if _t.startswith('<Wikipedia'):
+            _t = _t[_t.find('>')+1:]
         if _t.startswith('<NE:'):
             nel.append((_w, _t, acc))
         else:
@@ -257,7 +262,7 @@ def net_merge(nel: List[Tuple[str, str, str]]):
     """
     nes = []
     buf = ""
-    start = None
+    start = 0
     for word, net, pos in nel:
         ne = net[4:-3]
         if net == '<NE:OTHER:S>':
@@ -276,7 +281,7 @@ def net_merge(nel: List[Tuple[str, str, str]]):
     return nes
 
 
-def knp_analysis_file(target, *, logger=None, config=None):
+def knp_analysis_file(target, *, logger=None, config=None, pid=None):
     logger = logger or logging.getLogger(__name__)
     config = config or Config(logger=logger)
     idx = -1
@@ -288,11 +293,19 @@ def knp_analysis_file(target, *, logger=None, config=None):
             continue
         try:
             nel = knp_irex(line, logger=logger, config=config)
+            print(nel)
+            nes.extend([(*entry, idx) for entry in net_merge(nel)])
+        except TypeError as e:
+            if pid:
+                logger.error(f"in proceedings of {pid}")
+            logger.error(f"TypeError on '{nel}'")
+            logger.error(f"Error message: {str(e)}")
         except ShinraError as e:
+            if pid:
+                logger.error(f"in proceedings of {pid}")
             logger.error(f"UnicodeDecodeError on '{line.encode()}'")
             logger.error(f"Error message: {str(e)}")
             continue
-        nes.extend([(*entry, idx) for entry in net_merge(nel)])
     s_nes = sorted(nes, key=itemgetter(0))
     g_nes = groupby(s_nes, key=itemgetter(0))
     d_nes = {ne: [
@@ -340,7 +353,7 @@ def knp_extract_file(hpath: Path, ppath: Path, ene, pid, odir: Path,
     with open(ppath) as _pf:
         plain = _pf.read()
     try:
-        analyzed = knp_analysis_file(plain, logger=logger)
+        analyzed = knp_analysis_file(plain, logger=logger, pid=pid)
         title = htmltools.get_title(html)
     except ShinraError as e:
         logger.error(f"PID: {pid} :: {str(e)}")
@@ -362,6 +375,58 @@ def knp_extract_file(hpath: Path, ppath: Path, ene, pid, odir: Path,
                 obj["text_offset"] = ne
                 obj["attribute"] = attr
                 print(json.dumps(obj), file=_of)
+
+
+def knp_tab2iobtag(juman_lines, *, logger=None, config=None):
+    """
+    KNP の出力結果を("文字列", IOB2タグ) の形に纏める
+
+    Parameters
+    ------------
+    juman_lines: str
+       juman 形式の文字列（複数行）．EOS行で終了する．空行は含まない
+
+    Returns
+    ---------
+    [] if raised some error
+    """
+    logger = logger or logging.getLogger(__name__)
+    config = config or Config()
+    try:
+        kprs = subprocess.run(config.knp,
+                              input=juman_lines, text=True,
+                              encoding='utf-8',
+                              errors='replace',
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+    except Exception as e:
+        logger.error("Error in exec KNP")
+        logger.error(f"Error: {str(e)}")
+        return []
+    nel = []
+    for _l in kprs.stdout.split("\n"):
+        if len(_l) and _l[0] in {"+", "*", "#"}:
+            continue
+        _ll = _l.split(" ")
+        _w = _ll[0]
+        _t = _ll[-1]
+        idx = _t.find("<NE:")
+        if idx == -1:
+            nel.append((_w, "<NE:OTHER:S>"))
+        else:
+            end = _t.find(">", idx)
+            tag = _t[idx:end+1]
+            nel.append((_w, tag))
+    return nel
+
+
+def knp_string(string: str, *, logger=None, config=None):
+    """
+    現在はstring = 1行となっている？
+    各行毎にjumanでの解析をかけてknpで解析する
+    """
+    logger = logger or logging.getLogger(__name__)
+    config = config or Config()
 
 
 if __name__ == "__main__":
