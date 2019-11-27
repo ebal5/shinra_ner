@@ -201,86 +201,6 @@ class Config(object):
         self.multi = multi
 
 
-def knp_irex(line, *, logger=None, config=None):
-    """
-    KNPによるIREXタグの抽出
-
-    Parameters
-    ---------
-    line: str
-       解析対象行の文字列
-    """
-    logger = logger or logging.getLogger(__name__)
-    config = config or Config(logger=logger)
-    text = mojimoji.han_to_zen(line)
-    text = text.replace(u'\xa0', '　')
-    # diff = [i for i, b, a in zip(range(len(text)), line, text) if b != a]
-    print(text)
-    try:
-        jprs = subprocess.run(config.juman,
-                              input=text, text=True, encoding='utf-8',
-                              errors='replace',
-                              stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE)
-        kprs = subprocess.run(config.knp,
-                              input=jprs.stdout, text=True, encoding='utf-8',
-                              errors='replace',
-                              stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE)
-    except UnicodeDecodeError as e:
-        raise ShinraError(e)
-    nel = []
-    acc = 0
-    for _l in kprs.stdout.split("\n"):
-        if len(_l) and _l[0] in {"+", "*", "#"}:
-            continue
-        lst = _l.split(" ")
-        _t = lst[-1]
-        _w = line[acc:acc+len(lst[0])]
-        # while diff and (acc + len(_w)) > diff[0]:
-        #     wp = diff[0] - acc
-        #     tmp = _w
-        #     _w = _w[:wp] + mojimoji.zen_to_han(_w[wp]) + _w[wp+1:]
-        #     if tmp == _w:
-        #         _w = _w[:wp] + '\xa0' + _w[wp+1:]
-        #     diff = diff[1:]
-        if _t.startswith('<Wikipedia'):
-            _t = _t[_t.find('>')+1:]
-        if _t.startswith('<NE:'):
-            nel.append((_w, _t, acc))
-        else:
-            nel.append((_w, "<NE:OTHER:S>", acc))
-        acc += len(_w)
-    return nel
-
-
-def net_merge(nel: List[Tuple[str, str, str]]):
-    """
-    解析結果からIREX NEを作成する．
-
-    B-XXX I-XXX ... E-XXX を一まとまりとして文字列を作成させる# ．
-    """
-    nes = []
-    buf = ""
-    start = 0
-    for word, net, pos in nel:
-        ne = net[4:-3]
-        if net == '<NE:OTHER:S>':
-            continue
-        elif net[-2] == "S":
-            nes.append((ne, word, pos, pos+len(word)))
-        elif net[-2] == "B":
-            buf = word
-            start = pos
-        elif net[-2] == "E":
-            buf += word
-            nes.append((ne, buf, start, start+len(buf)))
-            buf = ""
-        elif net[-2] == "I":
-            buf += word
-    return nes
-
-
 def knp_analysis_file(target, *, logger=None, config=None, pid=None):
     logger = logger or logging.getLogger(__name__)
     config = config or Config(logger=logger)
@@ -292,9 +212,8 @@ def knp_analysis_file(target, *, logger=None, config=None, pid=None):
         if line.isascii():
             continue
         try:
-            nel = knp_irex(line, logger=logger, config=config)
-            print(nel)
-            nes.extend([(*entry, idx) for entry in net_merge(nel)])
+            nel = knp_string(line, logger=logger, config=config)
+            nes.extend([(*entry, idx) for entry in nel])
         except TypeError as e:
             if pid:
                 logger.error(f"in proceedings of {pid}")
@@ -405,6 +324,8 @@ def knp_tab2iobtag(juman_lines, *, logger=None, config=None):
         return []
     nel = []
     for _l in kprs.stdout.split("\n"):
+        if _l == "EOS":
+            break
         if len(_l) and _l[0] in {"+", "*", "#"}:
             continue
         _ll = _l.split(" ")
@@ -439,6 +360,17 @@ def collect_iobtag(iobtagl, *, logger=None):
     return tagl
 
 
+def juman_string(string: str, *, logger=None, config=None):
+    logger = logger or logging.getLogger(__name__)
+    config = config or Config()
+    jprs = subprocess.run(config.juman,
+                          input=string, text=True, encoding='utf-8',
+                          errors='replace',
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE)
+    return jprs.stdout
+
+
 def knp_string(string: str, *, logger=None, config=None):
     """
     現在はstring = 1行となっている？
@@ -446,6 +378,21 @@ def knp_string(string: str, *, logger=None, config=None):
     """
     logger = logger or logging.getLogger(__name__)
     config = config or Config()
+    logger.debug(f"convert into analyzable format")
+    logger.debug(f"{string}")
+    text = mojimoji.han_to_zen(string)
+    text = text.replace(u'\xa0', '　')
+    logger.debug(f"{text}")
+    jt = juman_string(text, logger=logger, config=config)
+    kt = knp_tab2iobtag(jt, logger=logger, config=config)
+    nel = collect_iobtag(kt, logger=logger)
+    _nnel = []
+    idx = 0
+    for _w, _ne in nel:
+        lw = len(_w)
+        _nnel.append((string[idx:idx+lw], _ne, idx, idx+lw))
+        idx += lw
+    return _nnel
 
 
 if __name__ == "__main__":
