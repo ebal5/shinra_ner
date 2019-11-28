@@ -23,6 +23,7 @@ matplotlib = "*"
 numpy = "*"
 scipy = "*"
 mojimoji = "*"
+spacy = "*"
 
 [requires]
 python_version = "3.7"

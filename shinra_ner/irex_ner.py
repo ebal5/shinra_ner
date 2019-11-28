@@ -62,12 +62,14 @@ def main():
     if ene is None:
         print(f"Invalid category name: {args.category}", file=sys.stderr)
         exit(1)
-    cfg = KNPConfig(multi=args.multi, queue=None,
-                    knp_cmd=args.knp, knp_opt=args.knp_opt,
-                    use_jumanpp=args.use_jumanpp,
-                    juman_cmd=args.juman)
-    knp_extract_files(args.html_dir, args.plain_dir,
-                      id_list, args.output, ene, config=cfg)
+    # cfg = KNPConfig(multi=args.multi, queue=None,
+    #                 knp_cmd=args.knp, knp_opt=args.knp_opt,
+    #                 use_jumanpp=args.use_jumanpp,
+    #                 juman_cmd=args.juman)
+    # knp_extract_files(args.html_dir, args.plain_dir,
+    #                   id_list, args.output, ene, config=cfg)
+    ginza_extract_files(args.html_dir, args.plain_dir,
+                        id_list, args.output, ene, multi=3)
     queue.put_nowait(None)
     log_listener.join()
 
@@ -387,6 +389,119 @@ class KNP_NERer(IREX_NERer):
                 tag = _t[idx:end+1]
                 nel.append((_w, tag))
         return nel
+
+
+def ginza_extract_files(html_dir, plain_dir, id_list, output, ene,
+                        *, logger=None, multi=1):
+    logger = logger or logging.getLogger(__name__)
+    logger.info("will extract files")
+    hdir = Path(html_dir)
+    pdir = Path(plain_dir)
+    tdir = Path(tempfile.mkdtemp())
+    logger.info(f"opened {str(tdir)} as tmpdir")
+    nerer = GiNZA_NERer(logger=logger)
+    for pid in id_list:
+        nerer.extract_file(
+            hdir.joinpath(pid+".html"), pdir.joinpath(pid+".txt"),
+            ene, pid, tdir)
+    logger.info("all files are extracted")
+    try:
+        with open(Path(output), "w") as outf:
+            for resf in tdir.glob("*.json"):
+                with open(resf) as _rf:
+                    outf.write(_rf.read())
+        shutil.rmtree(tdir)
+    except Exception as e:
+        logger.error(f"some error: {str(e)}")
+
+
+class GiNZA_NERer(IREX_NERer):
+
+    def __init__(self, *, logger=None):
+        import spacy
+        super().__init__(logger=logger)
+        self.nlp = spacy.load('ja_ginza')
+
+    def eval_string(self, sentence):
+        self.logger.info(f"will evaluate string")
+        doc = self.nlp(sentence)
+        _nnel = [(ent.text, ent.label_, ent.start_char, ent.end_char)
+                 for ent in doc.ents]
+        return [(sentence[start:end], ne, start, end)
+                for _, ne, start, end in _nnel]
+
+    def analysis_file(self, target):
+        idx = -1
+        nes = []
+        stream = io.StringIO(target) if type(target) == str else target
+        for line in stream.readlines():
+            idx += 1
+            if line.isascii():
+                continue
+            try:
+                nel = self.eval_string(line)
+                self.logger.debug(f"add {len(nel)} to nes")
+                nes.extend([(*entry, idx) for entry in nel])
+            except TypeError as e:
+                if self.pid:
+                    self.logger.error(f"in proceedings of {self.pid}")
+                self.logger.error(f"TypeError on '{nel}'")
+                self.logger.error(f"Error message: {str(e)}")
+            except ShinraError as e:
+                if self.pid:
+                    self.logger.error(f"in proceedings of {self.pid}")
+                self.logger.error(f"Error on '{line.encode()}'")
+                self.logger.error(f"Error message: {str(e)}")
+                continue
+        self.logger.debug(f"all ne: {len(nes)}")
+        s_nes = sorted(nes, key=itemgetter(1))
+        g_nes = groupby(s_nes, key=itemgetter(1))
+        d_nes = {ne: [
+            {
+                "start": {"line_id": l, "offset": s},
+                "end": {"line_id": l, "offset": e},
+                "text": w,
+            } for w, _, s, e, l in list(lst)] for ne, lst in g_nes}
+        self.nes = d_nes
+        self._nes = nes
+        return d_nes
+
+    def extract_file(self, hpath: Path, ppath: Path,
+                     ene, pid, odir: Path):
+        self.logger.info(f"start {pid}")
+        self.pid = pid
+        self.ene = ene
+        with open(hpath) as _hf:
+            html = _hf.read()
+        with open(ppath) as _pf:
+            plain = _pf.read()
+        try:
+            self.title = htmltools.get_title(html)
+            analyzed = self.analysis_file(plain)
+            self.logger.info(
+                f"{sum([len(v) for v in analyzed.values()])} NE's")
+        except ShinraError as e:
+            self.logger.error(f"PID: {pid} :: {str(e)}")
+            raise ShinraError(f"Error in PID: {pid}, msg: {str(e)}", e)
+        enekey = ene.replace(".", "_")
+        base = {
+            "page_id": str(pid),
+            "title": self.title,
+            "ENE": ene
+        }
+        with open(odir.joinpath(f"{pid}.json"), "w") as _of:
+            mypair = IREX_NERer.pairs[enekey]
+            for ne, attrs in mypair.items():
+                nel = analyzed.get(ne, None)
+                if not nel:
+                    continue
+                for (attr, ne) in product(attrs, nel):
+                    obj = copy.copy(base)
+                    obj["text_offset"] = ne
+                    obj["attribute"] = attr
+                    print(json.dumps(obj), file=_of)
+        self.logger.info(f"end {pid}")
+
 
 
 if __name__ == "__main__":
