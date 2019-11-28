@@ -3,6 +3,8 @@ import copy
 import io
 import json
 import logging
+import logging.handlers
+import multiprocessing
 import os
 import shutil
 import subprocess
@@ -19,31 +21,10 @@ from typing import List, Tuple
 import mojimoji
 from joblib import Parallel, delayed
 
+from ner import IREX_NERer
 from shinra_error import ShinraError
 from tools import html as htmltools
 
-pairs = {'1_1': {'ARTIFACT': ['作品', '受賞歴', '参加イベント'],
-                 'DATE': ['生年月日', '没年月日'],
-                 'LOCATION': ['生誕地', '居住地', '没地'],
-                 'ORGANIZATION': ['所属組織'],
-                 'PERSON': ['師匠', '両親', '家族']},
-         '1_10_2': {},
-         '1_4_6_2': {'ARTIFACT': ['取扱商品', '商品名'],
-                     'DATE': ['従業員数（単体）データの年'],
-                     'LOCATION': ['創業国', '創業地', '本拠地国', '本拠地'],
-                     'MONEY': ['売上高（単体）'],
-                     'ORGANIZATION': ['子会社・合弁会社', '買収・合併した会社', '主要株主'],
-                     'PERSON': ['代表者']},
-         '1_5_1_1': {'ARTIFACT': ['観光地', '恒例行事', '特産品'],
-                     'DATE': ['人口データの年'],
-                     'LOCATION': ['友好市区町村'],
-                     'ORGANIZATION': ['鉄道会社'],
-                     'PERSON': ['首長']},
-         '1_6_5_3': {'ARTIFACT': ['名称由来人物の地位職業名'],
-                     'DATE': ['年間利用者数データの年'],
-                     'LOCATION': ['国', '所在地', '母都市'],
-                     'ORGANIZATION': ['運営者'],
-                     'TIME': ['運用時間']}}
 cat2ene = {
     "airport": "1.6.5.3",
     "city": "1.5.1.1",
@@ -60,9 +41,15 @@ class ConfigurationError(ShinraError):
 def main():
     parser = _mk_argparser()
     args = parser.parse_args()
-    logger = _mk_logger(args.debug, args.log_file)
+    queue = multiprocessing.Queue(-1)
+    log_listener = multiprocessing.Process(
+        target=_listener_process,
+        args=(queue, args.debug, args.log_file))
+    log_listener.start()
     dirs = [args.html_dir, args.plain_dir]
     files = [args.id_list]
+    # logger = worker_configurer(queue, __name__)
+    logger = logging.getLogger(__name__)
     if not _check_environ(files, dirs, logger=logger):
         exit(1)
     logger.info("environ check cleared")
@@ -75,9 +62,14 @@ def main():
     if ene is None:
         print(f"Invalid category name: {args.category}", file=sys.stderr)
         exit(1)
+    cfg = KNPConfig(multi=args.multi, queue=None,
+                    knp_cmd=args.knp, knp_opt=args.knp_opt,
+                    use_jumanpp=args.use_jumanpp,
+                    juman_cmd=args.juman)
     knp_extract_files(args.html_dir, args.plain_dir,
-                      id_list, args.output, ene,
-                      logger=logger, multi=args.multi)
+                      id_list, args.output, ene, config=cfg)
+    queue.put_nowait(None)
+    log_listener.join()
 
 
 def _check_environ(files, dirs, *, logger=None):
@@ -103,7 +95,7 @@ def _check_environ(files, dirs, *, logger=None):
     return True
 
 
-def _mk_logger(debug_mode, log_file="irex_ner.log"):
+def _listener_process(queue, debug_mode, log_file="irex_ner.log"):
     level = logging.WARNING if not debug_mode else logging.DEBUG
     logging.basicConfig(level=level)
     root_logger = logging.getLogger(__name__)
@@ -118,7 +110,25 @@ def _mk_logger(debug_mode, log_file="irex_ner.log"):
     )
     handler.setFormatter(formatter)
     root_logger.addHandler(handler)
-    return root_logger
+    while True:
+        try:
+            record = queue.get()
+            if record is None:
+                break
+            logger = logging.getLogger(record.name)
+            logger.handle(record)
+        except Exception:
+            import traceback
+            print('Whoops! Problem:', file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+
+
+def worker_configurer(queue, name):
+    h = logging.handlers.QueueHandler(queue)
+    root = logging.getLogger()
+    root.addHandler(h)
+    root.setLevel(logging.DEBUG)
+    return logging.getLogger(name)
 
 
 def _mk_argparser():
@@ -137,6 +147,12 @@ def _mk_argparser():
                         action='store',
                         default='knp',
                         help='executable of knp')
+    parser.add_argument("--knp-opt",
+                        action='store',
+                        type=str,
+                        nargs="+",
+                        default=['-simple', "-anaphora"],
+                        help='options for knp')
     parser.add_argument("--use-jumanpp",
                         action='store',
                         default=True,
@@ -182,14 +198,10 @@ class IREX_NE(Flag):
     ARTIFACT = auto()
 
 
-class Config(object):
-    def __init__(self, *, multi=1, logger=None,
-                 knp_cmd="knp",
-                 knp_opt=["-simple", "-anaphora"],
-                 use_jumanpp=True,
-                 juman_cmd=None,
-                 juman_opt=None):
-        self.logger = logger or logging.getLogger(__name__)
+class KNPConfig(object):
+    def __init__(self, *, multi=1, queue=None,
+                 knp_cmd="knp", knp_opt=["-simple", "-anaphora"],
+                 use_jumanpp=True, juman_cmd=None, juman_opt=None):
         self.knp_cmd = knp_cmd
         self.knp_opt = knp_opt
         self.knp = [self.knp_cmd, *knp_opt] \
@@ -199,57 +211,22 @@ class Config(object):
         self.juman = [self.juman_cmd, juman_opt] \
             if juman_opt else [self.juman_cmd]
         self.multi = multi
-
-
-def knp_analysis_file(target, *, logger=None, config=None, pid=None):
-    logger = logger or logging.getLogger(__name__)
-    config = config or Config(logger=logger)
-    idx = -1
-    nes = []
-    stream = io.StringIO(target) if type(target) == str else target
-    for line in stream.readlines():
-        idx += 1
-        if line.isascii():
-            continue
-        try:
-            nel = knp_string(line, logger=logger, config=config)
-            nes.extend([(*entry, idx) for entry in nel])
-        except TypeError as e:
-            if pid:
-                logger.error(f"in proceedings of {pid}")
-            logger.error(f"TypeError on '{nel}'")
-            logger.error(f"Error message: {str(e)}")
-        except ShinraError as e:
-            if pid:
-                logger.error(f"in proceedings of {pid}")
-            logger.error(f"UnicodeDecodeError on '{line.encode()}'")
-            logger.error(f"Error message: {str(e)}")
-            continue
-    s_nes = sorted(nes, key=itemgetter(0))
-    g_nes = groupby(s_nes, key=itemgetter(0))
-    d_nes = {ne: [
-        {
-            "start": {"line_id": l, "offset": s},
-            "end": {"line_id": l, "offset": e},
-            "text": w,
-        } for _, w, s, e, l in list(lst)] for ne, lst in g_nes}
-    return d_nes
+        self.queue = queue
 
 
 def knp_extract_files(html_dir, plain_dir, id_list, output, ene,
-                      *, multi=1, logger=None, config=None):
+                      *, logger=None, config=None):
     logger = logger or logging.getLogger(__name__)
     logger.info("will extract files")
-    config = config or Config(logger=logger)
+    config = config or KNPConfig(logger=logger)
     hdir = Path(html_dir)
     pdir = Path(plain_dir)
     tdir = Path(tempfile.mkdtemp())
     logger.info(f"opened {str(tdir)} as tmpdir")
-    Parallel(n_jobs=multi)([
-        delayed(knp_extract_file)(hdir.joinpath(pid+".html"),
-                                  pdir.joinpath(pid+".txt"),
-                                  ene, pid, tdir,
-                                  config=config)
+    Parallel(n_jobs=config.multi)([
+        delayed(KNP_NERer(config=config).knp_extract_file)
+        (hdir.joinpath(pid+".html"), pdir.joinpath(pid+".txt"),
+         ene, pid, tdir)
         for pid in id_list
     ])
     logger.info("all files are extracted")
@@ -263,136 +240,153 @@ def knp_extract_files(html_dir, plain_dir, id_list, output, ene,
         logger.error(f"some error: {str(e)}")
 
 
-def knp_extract_file(hpath: Path, ppath: Path, ene, pid, odir: Path,
-                     *, logger=None, config=None):
-    logger = logger or logging.getLogger(__name__)
-    config = config or Config(logger=logger)
-    with open(hpath) as _hf:
-        html = _hf.read()
-    with open(ppath) as _pf:
-        plain = _pf.read()
-    try:
-        analyzed = knp_analysis_file(plain, logger=logger, pid=pid)
-        title = htmltools.get_title(html)
-    except ShinraError as e:
-        logger.error(f"PID: {pid} :: {str(e)}")
-        raise ShinraError(f"Error in PID: {pid}, msg: {str(e)}", e)
-    enekey = ene.replace(".", "_")
-    base = {
-        "page_id": str(pid),
-        "title": title,
-        "ENE": ene
-    }
-    with open(odir.joinpath(f"{pid}.json"), "w") as _of:
-        mypair = pairs[enekey]
-        for ne, attrs in mypair.items():
-            nel = analyzed.get(ne, None)
-            if not nel:
+class KNP_NERer(IREX_NERer):
+    def __init__(self, *, logger=None, config: KNPConfig = None):
+        super().__init__(logger=logger)
+        self.config = config or KNPConfig()
+
+    def knp_extract_file(self, hpath: Path, ppath: Path,
+                         ene, pid, odir: Path):
+        self.logger.info(f"start {pid}")
+        self.pid = pid
+        self.ene = ene
+        with open(hpath) as _hf:
+            html = _hf.read()
+        with open(ppath) as _pf:
+            plain = _pf.read()
+        try:
+            self.title = htmltools.get_title(html)
+            analyzed = self.knp_analysis_file(plain)
+            self.logger.info(
+                f"{sum([len(v) for v in analyzed.values()])} NE's")
+        except ShinraError as e:
+            self.logger.error(f"PID: {pid} :: {str(e)}")
+            raise ShinraError(f"Error in PID: {pid}, msg: {str(e)}", e)
+        enekey = ene.replace(".", "_")
+        base = {
+            "page_id": str(pid),
+            "title": self.title,
+            "ENE": ene
+        }
+        with open(odir.joinpath(f"{pid}.json"), "w") as _of:
+            mypair = IREX_NERer.pairs[enekey]
+            for ne, attrs in mypair.items():
+                nel = analyzed.get(ne, None)
+                if not nel:
+                    continue
+                for (attr, ne) in product(attrs, nel):
+                    obj = copy.copy(base)
+                    obj["text_offset"] = ne
+                    obj["attribute"] = attr
+                    print(json.dumps(obj), file=_of)
+        self.logger.info(f"end {pid}")
+
+    def knp_analysis_file(self, target):
+        idx = -1
+        nes = []
+        stream = io.StringIO(target) if type(target) == str else target
+        for line in stream.readlines():
+            idx += 1
+            if line.isascii():
                 continue
-            for (attr, ne) in product(attrs, nel):
-                obj = copy.copy(base)
-                obj["text_offset"] = ne
-                obj["attribute"] = attr
-                print(json.dumps(obj), file=_of)
+            try:
+                nel = self.knp_string(line)
+                self.logger.debug(f"add {len(nel)} to nes")
+                nes.extend([(*entry, idx) for entry in nel])
+            except TypeError as e:
+                if self.pid:
+                    self.logger.error(f"in proceedings of {self.pid}")
+                self.logger.error(f"TypeError on '{nel}'")
+                self.logger.error(f"Error message: {str(e)}")
+            except ShinraError as e:
+                if self.pid:
+                    self.logger.error(f"in proceedings of {self.pid}")
+                self.logger.error(f"Error on '{line.encode()}'")
+                self.logger.error(f"Error message: {str(e)}")
+                continue
+        self.logger.debug(f"all ne: {len(nes)}")
+        s_nes = sorted(nes, key=itemgetter(1))
+        g_nes = groupby(s_nes, key=itemgetter(1))
+        d_nes = {ne: [
+            {
+                "start": {"line_id": l, "offset": s},
+                "end": {"line_id": l, "offset": e},
+                "text": w,
+            } for w, _, s, e, l in list(lst)] for ne, lst in g_nes}
+        self.nes = d_nes
+        self._nes = nes
+        return d_nes
 
+    def knp_string(self, string: str):
+        """
+        現在はstring = 1行となっている？
+        各行毎にjumanでの解析をかけてknpで解析する
+        """
+        self.logger.debug(f"convert into analyzable format")
+        text = mojimoji.han_to_zen(string)
+        text = text.replace(u'\xa0', '　')
+        jt = self.juman_string(text)
+        kt = self.knp_tab2iobtag(jt)
+        nel = self.collect_iobtag(kt)
+        _nnel = []
+        idx = 0
+        for _w, _ne in nel:
+            lw = len(_w)
+            _nnel.append((string[idx:idx+lw], _ne, idx, idx+lw))
+            idx += lw
+        return _nnel
 
-def knp_tab2iobtag(juman_lines, *, logger=None, config=None):
-    """
-    KNP の出力結果を("文字列", IOB2タグ) の形に纏める
-
-    Parameters
-    ------------
-    juman_lines: str
-       juman 形式の文字列（複数行）．EOS行で終了する．空行は含まない
-
-    Returns
-    ---------
-    [] if raised some error
-    """
-    logger = logger or logging.getLogger(__name__)
-    config = config or Config()
-    try:
-        kprs = subprocess.run(config.knp,
-                              input=juman_lines, text=True,
-                              encoding='utf-8',
+    def juman_string(self, string: str):
+        jprs = subprocess.run(self.config.juman,
+                              input=string, text=True, encoding='utf-8',
                               errors='replace',
                               stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE)
-    except Exception as e:
-        logger.error("Error in exec KNP")
-        logger.error(f"Error: {str(e)}")
-        return []
-    nel = []
-    for _l in kprs.stdout.split("\n"):
-        if _l == "EOS":
-            break
-        if len(_l) and _l[0] in {"+", "*", "#"}:
-            continue
-        _ll = _l.split(" ")
-        _w = _ll[0]
-        _t = _ll[-1]
-        idx = _t.find("<NE:")
-        if idx == -1:
-            nel.append((_w, "<NE:OTHER:S>"))
-        else:
-            end = _t.find(">", idx)
-            tag = _t[idx:end+1]
-            nel.append((_w, tag))
-    return nel
+        return jprs.stdout
 
+    def knp_tab2iobtag(self, juman_lines):
+        """
+        KNP の出力結果を("文字列", IOB2タグ) の形に纏める
 
-def collect_iobtag(iobtagl, *, logger=None):
-    logger = logger or logging.getLogger(__name__)
-    tagl = []
-    buf = ""
-    for _w, _t in iobtagl:
-        ne = _t[4:-3]
-        ptn = _t[-2]
-        if ptn in {"S", "E"}:
-            buf += _w
-            tagl.append((buf, ne))
-            buf = ""
-        elif ptn in {"B", "I"}:
-            buf += _w
-        else:
-            logger.error(f"invalid:: {_w, _t}")
-            raise ShinraError("Invalid IOBTAG")
-    return tagl
+        Parameters
+        ------------
+        juman_lines: str
+           juman 形式の文字列（複数行）．EOS行で終了する．空行は含まない
 
-
-def juman_string(string: str, *, logger=None, config=None):
-    logger = logger or logging.getLogger(__name__)
-    config = config or Config()
-    jprs = subprocess.run(config.juman,
-                          input=string, text=True, encoding='utf-8',
-                          errors='replace',
-                          stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE)
-    return jprs.stdout
-
-
-def knp_string(string: str, *, logger=None, config=None):
-    """
-    現在はstring = 1行となっている？
-    各行毎にjumanでの解析をかけてknpで解析する
-    """
-    logger = logger or logging.getLogger(__name__)
-    config = config or Config()
-    logger.debug(f"convert into analyzable format")
-    logger.debug(f"{string}")
-    text = mojimoji.han_to_zen(string)
-    text = text.replace(u'\xa0', '　')
-    logger.debug(f"{text}")
-    jt = juman_string(text, logger=logger, config=config)
-    kt = knp_tab2iobtag(jt, logger=logger, config=config)
-    nel = collect_iobtag(kt, logger=logger)
-    _nnel = []
-    idx = 0
-    for _w, _ne in nel:
-        lw = len(_w)
-        _nnel.append((string[idx:idx+lw], _ne, idx, idx+lw))
-        idx += lw
-    return _nnel
+        Returns
+        ---------
+        [] if raised some error
+        """
+        try:
+            self.logger.debug("will execute KNP")
+            kprs = subprocess.run(self.config.knp,
+                                  input=juman_lines, text=True,
+                                  encoding='utf-8',
+                                  errors='replace',
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE)
+        except Exception as e:
+            self.logger.error("Error in exec KNP")
+            self.logger.error(f"Error: {str(e)}")
+            print(self.config.knp)
+            return []
+        nel = []
+        for _l in kprs.stdout.split("\n"):
+            if _l == "EOS":
+                break
+            if len(_l) and _l[0] in {"+", "*", "#"}:
+                continue
+            _ll = _l.split(" ")
+            _w = _ll[0]
+            _t = _ll[-1]
+            idx = _t.find("<NE:")
+            if idx == -1:
+                nel.append((_w, "<NE:OTHER:S>"))
+            else:
+                end = _t.find(">", idx)
+                tag = _t[idx:end+1]
+                nel.append((_w, tag))
+        return nel
 
 
 if __name__ == "__main__":
